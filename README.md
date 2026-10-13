@@ -362,7 +362,6 @@ These are proposed endpoints; implement the corresponding Django routes and requ
 
 ## 👩‍💻 Contributors
 
-- **Vaishnavi Thaware**
 - **Devyani Raghatate**
 
 ## 📄 License
