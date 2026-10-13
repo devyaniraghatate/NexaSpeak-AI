@@ -1,289 +1,161 @@
-```python
 import os
 import tempfile
+from typing import List
+
 import streamlit as st
-from dotenv import load_dotenv
+from openai import OpenAI
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
-load_dotenv()
-
-st.set_page_config(
-    page_title="NexaSpeak AI",
-    page_icon="🎙️",
-    layout="wide"
-)
+st.set_page_config(page_title="NexaSpeak AI", page_icon="🎙️", layout="wide")
 
 st.title("🎙️ NexaSpeak AI")
-st.caption("Speak Beyond Limits. Think Beyond Boundaries.")
+st.caption("A document-aware AI assistant. Add an API-compatible language model to enable answers.")
 
-# ---------------- SESSION STATE ----------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "documents" not in st.session_state:
-    st.session_state.documents = []
-
-# ---------------- SIDEBAR ----------------
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    provider_url = st.text_input(
-        "LLM API Base URL",
-        value=os.getenv(
-            "LLM_API_BASE",
-            "https://api.openai.com/v1"
-        )
-    )
-
-    api_key = st.text_input(
-        "LLM API Key",
-        value=os.getenv("LLM_API_KEY", ""),
-        type="password"
-    )
-
-    model_name = st.text_input(
-        "Model name",
-        value=os.getenv("LLM_MODEL", "")
-    )
-
-    st.divider()
-
-    uploaded_files = st.file_uploader(
-        "Upload knowledge documents",
-        type=["txt", "md", "pdf"],
-        accept_multiple_files=True
-    )
-
-    if st.button("Clear conversation"):
-        st.session_state.messages = []
-        st.rerun()
-
-# ---------------- DOCUMENT READING ----------------
-def read_document(uploaded_file):
-    filename = uploaded_file.name.lower()
-
-    if filename.endswith((".txt", ".md")):
-        return uploaded_file.getvalue().decode(
-            "utf-8", errors="ignore"
-        )
-
-    if filename.endswith(".pdf"):
-        try:
-            from pypdf import PdfReader
-            import io
-
-            reader = PdfReader(
-                io.BytesIO(uploaded_file.getvalue())
-            )
-
-            return "\n".join(
-                page.extract_text() or ""
-                for page in reader.pages
-            )
-        except Exception as exc:
-            st.warning(f"Could not read PDF: {exc}")
-            return ""
-
-    return ""
+# Cache the embedding model so it is not downloaded again on every rerun.
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
 
-def split_text(text, chunk_size=900, overlap=120):
+def extract_text(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        reader = PdfReader(uploaded_file)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return uploaded_file.getvalue().decode("utf-8", errors="ignore")
+
+
+def split_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
     text = " ".join(text.split())
-
     if not text:
         return []
-
     chunks = []
     start = 0
-
     while start < len(text):
-        chunks.append(text[start:start + chunk_size])
-        start += chunk_size - overlap
-
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start = max(end - overlap, start + 1)
     return chunks
 
 
-# ---------------- SIMPLE RAG RETRIEVAL ----------------
-def retrieve_context(question, chunks, top_k=4):
-    """Semantic retrieval using sentence-transformer embeddings."""
+def retrieve_context(question: str, chunks: List[str], model, top_k: int = 3) -> str:
     if not chunks:
-        return []
-
-    try:
-        from sentence_transformers import SentenceTransformer
-        from sklearn.metrics.pairwise import cosine_similarity
-
-        if "embedder" not in st.session_state:
-            st.session_state.embedder = SentenceTransformer(
-                "sentence-transformers/all-MiniLM-L6-v2"
-            )
-
-        embedder = st.session_state.embedder
-
-        chunk_vectors = embedder.encode(
-            chunks,
-            normalize_embeddings=True
-        )
-
-        query_vector = embedder.encode(
-            [question],
-            normalize_embeddings=True
-        )
-
-        scores = cosine_similarity(
-            query_vector, chunk_vectors
-        )[0]
-
-        indices = scores.argsort()[::-1][:top_k]
-
-        return [
-            chunks[i]
-            for i in indices
-            if scores[i] > 0.15
-        ]
-
-    except Exception as exc:
-        st.warning(f"Document retrieval unavailable: {exc}")
-        return []
+        return ""
+    vectors = model.encode(chunks, convert_to_numpy=True)
+    question_vector = model.encode([question], convert_to_numpy=True)
+    scores = cosine_similarity(question_vector, vectors)[0]
+    best_indices = scores.argsort()[-top_k:][::-1]
+    return "\n\n".join(chunks[i] for i in best_indices if scores[i] > 0.15)
 
 
-# ---------------- LLM RESPONSE ----------------
-def generate_answer(question, context):
-    if not api_key or not model_name:
-        return (
-            "The interface is working, but an LLM is not configured. "
-            "Enter a valid API key and model name in the sidebar "
-            "to generate AI responses."
-        )
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url=provider_url
-        )
-
-        system_prompt = (
-            "You are NexaSpeak AI, a helpful voice assistant. "
-            "Answer clearly and accurately. If reference documents "
-            "are provided, prioritize them and mention their filenames "
-            "when available. If the documents do not contain the answer, "
-            "say so instead of inventing information."
-        )
-
-        if context:
-            system_prompt += (
-                "\n\nRelevant document passages:\n"
-                + "\n\n".join(context)
-            )
-
-        recent_messages = [
-            {
-                "role": item["role"],
-                "content": item["content"]
-            }
-            for item in st.session_state.messages[-8:]
-            if item["role"] in ("user", "assistant")
-        ]
-
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                *recent_messages,
-                {"role": "user", "content": question}
-            ],
-            temperature=0.3
-        )
-
-        return response.choices[0].message.content
-
-    except Exception as exc:
-        return f"Could not generate a response. Check your model settings. Details: {exc}"
-
-
-# ---------------- PROCESS UPLOADED FILES ----------------
-all_chunks = []
-
-if uploaded_files:
-    for file in uploaded_files:
-        document_text = read_document(file)
-
-        for chunk in split_text(document_text):
-            all_chunks.append(
-                f"Source: {file.name}\n{chunk}"
-            )
-
-    st.sidebar.success(
-        f"{len(uploaded_files)} document(s) loaded"
+with st.sidebar:
+    st.header("Settings")
+    api_base_url = st.text_input(
+        "API base URL (optional)",
+        value=os.getenv("OPENAI_BASE_URL", ""),
+        placeholder="https://api.openai.com/v1",
+        help="Use your provider's OpenAI-compatible API endpoint. Leave blank for the default OpenAI endpoint.",
+    )
+    api_key = st.text_input(
+        "API key",
+        value=os.getenv("OPENAI_API_KEY", ""),
+        type="password",
+        help="Your key is used for this app session. Do not share it publicly.",
+    )
+    model_name = st.text_input(
+        "Model name",
+        value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    )
+    st.divider()
+    st.subheader("Knowledge documents")
+    uploaded_files = st.file_uploader(
+        "Upload PDF, TXT, or Markdown files",
+        type=["pdf", "txt", "md"],
+        accept_multiple_files=True,
     )
 
-# ---------------- CHAT HISTORY ----------------
-st.subheader("💬 Your conversation")
+all_chunks = []
+if uploaded_files:
+    with st.spinner("Reading your documents..."):
+        for file in uploaded_files:
+            extracted = extract_text(file)
+            all_chunks.extend([f"Source: {file.name}\n{chunk}" for chunk in split_text(extracted)])
+    st.sidebar.success(f"Loaded {len(uploaded_files)} file(s), {len(all_chunks)} text chunk(s).")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+with st.sidebar:
+    if st.button("Clear current chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+    st.caption("Chat history is kept only for this active session; it is not stored in a database.")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# ---------------- CHAT INPUT ----------------
-question = st.chat_input("Ask NexaSpeak AI anything...")
+question = st.chat_input("Ask NexaSpeak AI a question...")
 
 if question:
-    st.session_state.messages.append({
-        "role": "user",
-        "content": question
-    })
-
+    st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            context = retrieve_context(question, all_chunks)
-            answer = generate_answer(question, context)
+    if not api_key.strip():
+        answer = "Please add your API key in the sidebar to enable AI responses. You can upload documents first, then ask questions after configuring the model."
+        with st.chat_message("assistant"):
             st.markdown(answer)
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer
-    })
-
-# ---------------- OPTIONAL TEXT-TO-SPEECH ----------------
-st.divider()
-st.subheader("🔊 Voice output")
-
-if st.session_state.messages:
-    latest_answer = next(
-        (
-            m["content"]
-            for m in reversed(st.session_state.messages)
-            if m["role"] == "assistant"
-        ),
-        ""
-    )
-
-    if st.button("Generate speech for latest answer"):
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+    else:
         try:
-            from gtts import gTTS
+            client_args = {"api_key": api_key.strip()}
+            if api_base_url.strip():
+                client_args["base_url"] = api_base_url.strip()
+            client = OpenAI(**client_args)
 
-            audio_file = tempfile.NamedTemporaryFile(
-                suffix=".mp3", delete=False
+            context = ""
+            if all_chunks:
+                with st.spinner("Searching your documents..."):
+                    embedder = load_embedding_model()
+                    context = retrieve_context(question, all_chunks, embedder)
+
+            system_prompt = (
+                "You are NexaSpeak AI, a clear and helpful assistant. "
+                "If document context is provided, use it when relevant. "
+                "If the context does not contain the answer, say so and then distinguish any general knowledge."
             )
+            if context:
+                system_prompt += "\n\nRelevant document context:\n" + context
 
-            gTTS(
-                text=latest_answer,
-                lang="en"
-            ).save(audio_file.name)
+            # Exclude the current question from history here because it is sent separately below.
+            prior_messages = st.session_state.messages[:-1][-10:]
+            api_messages = [{"role": "system", "content": system_prompt}]
+            api_messages.extend(
+                {"role": m["role"], "content": m["content"]} for m in prior_messages
+            )
+            api_messages.append({"role": "user", "content": question})
 
-            with open(audio_file.name, "rb") as audio:
-                st.audio(audio.read(), format="audio/mp3")
-
-            os.unlink(audio_file.name)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    response = client.chat.completions.create(
+                        model=model_name.strip(),
+                        messages=api_messages,
+                        temperature=0.4,
+                    )
+                    answer = response.choices[0].message.content or "I couldn't generate a response. Please try again."
+                st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
 
         except Exception as exc:
-            st.error(f"Speech generation failed: {exc}")
+            answer = f"The AI request failed: {exc}\n\nCheck your API key, model name, and API base URL in the sidebar."
+            with st.chat_message("assistant"):
+                st.error(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
 
-st.caption(
-    "NexaSpeak AI · Prototype · Verify important AI-generated information."
-)
-```
+st.divider()
+st.caption("Prototype note: this version supports text chat and document retrieval. Microphone transcription, KittenTTS voice output, persistent accounts, and database-backed chat history are not included yet.")
